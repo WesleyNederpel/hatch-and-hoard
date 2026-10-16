@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hatch &amp; Hoard - render test</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1b1424; overflow: hidden; color: #ddd; font: 12px sans-serif; }
+  #wrap { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { width: min(1280px, 100vw); height: auto; flex: none; }
+  #hud { position: absolute; left: 6px; bottom: 4px; opacity: .7; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="1280" height="720"></canvas></div>
+<div id="hud">render test: P pause, click = fire event burst, mouse = placing ghost</div>
+<script src="../js/core/namespace.js"></script>
+<script src="../js/core/rng.js"></script>
+<script src="../js/core/pool.js"></script>
+<script src="../js/core/events.js"></script>
+<script src="../js/data/config.js"></script>
+<script src="../js/data/dragons.js"></script>
+<script src="../js/data/instincts.js"></script>
+<script src="../js/data/evolutions.js"></script>
+<script src="../js/data/enemies.js"></script>
+<script src="../js/data/waves.js"></script>
+<script src="../js/data/levels.js"></script>
+<script src="../js/render/particles.js"></script>
+<script src="../js/render/art_map.js"></script>
+<script src="../js/render/art_enemies.js"></script>
+<script src="../js/render/art_dragons.js"></script>
+<script src="../js/render/renderer.js"></script>
+<script>
+(function () {
+  var HH = globalThis.HH, C = HH.data.config;
+  var level = HH.data.levels.meadow;
+  var wp = level.waypoints;
+
+  // stub canPlace: not within 40px of the path
+  function distSeg(px, py, ax, ay, bx, by) {
+    var dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+    var t = l2 ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / l2)) : 0;
+    return Math.hypot(ax + dx * t - px, ay + dy * t - py);
+  }
+  HH.sim.canPlace = function (g, x, y) {
+    for (var i = 0; i < wp.length - 1; i++) if (distSeg(x, y, wp[i][0], wp[i][1], wp[i + 1][0], wp[i + 1][1]) < 40) return false;
+    return true;
+  };
+
+  // path walking helper
+  var lens = [], total = 0;
+  for (var i = 0; i < wp.length - 1; i++) { var l = Math.hypot(wp[i + 1][0] - wp[i][0], wp[i + 1][1] - wp[i][1]); lens.push(l); total += l; }
+  function at(d) {
+    d = ((d % total) + total) % total;
+    var j = 0; while (j < lens.length - 1 && d > lens[j]) { d -= lens[j]; j++; }
+    var t = d / lens[j];
+    return { x: wp[j][0] + (wp[j + 1][0] - wp[j][0]) * t, y: wp[j][1] + (wp[j + 1][1] - wp[j][1]) * t, angle: Math.atan2(wp[j + 1][1] - wp[j][1], wp[j + 1][0] - wp[j][0]) };
+  }
+
+  var defs = HH.data.enemies;
+  var spec = [
+    ['peasant', 1, 1, {}], ['scout', 1, 2, { burn: { t: 2, dps: 1, stacks: 1 } }], ['militia', 2, 4, { chill: { stacks: 2, t: 2 } }],
+    ['shieldbearer', 3, 6, { freeze: { t: 1 } }], ['peasant', 1, 1, { burn: { t: 2, dps: 1, stacks: 1 }, poison: { stacks: 2, t: 3, dps: .4 }, blight: true }],
+    ['scout', 2, 2, { chill: { stacks: 1, t: 2 }, poison: { stacks: 1, t: 3, dps: .4 } }], ['militia', 3, 4, { poison: { stacks: 3, t: 3, dps: .4 } }],
+    ['shieldbearer', 6, 6, { burn: { t: 2, dps: 1, stacks: 1 } }], ['scout', 1, 2, { freeze: { t: 1 } }], ['militia', 4, 4, {}]
+  ];
+  var enemies = spec.map(function (s, k) {
+    var def = defs[s[0]], a = at(80 + k * 95);
+    return { id: k + 1, active: true, type: s[0], def: def, x: a.x, y: a.y, angle: a.angle, dist: 80 + k * 95, lane: 0,
+      hp: s[1], maxHp: s[2], armor: def.armor, wave: 0,
+      status: { burn: s[3].burn || null, chill: s[3].chill || null, freeze: s[3].freeze || null, poison: s[3].poison || null, shred: 0, auraSlow: 0, blight: !!s[3].blight },
+      hitT: 9, spawnT: 0 };
+  });
+
+  var fakeDef = {
+    ember: { id: 'ember', element: 'fire', base: { range: 140 } },
+    frost: { id: 'frost', element: 'frost', base: { range: 130 } },
+    venom: { id: 'venom', element: 'venom', base: { range: 120 } }
+  };
+  // only use the hardcoded defs if the data agent has not filled dragons.js yet
+  var dragonDefs = HH.data.dragons && HH.data.dragons.ember ? HH.data.dragons : (HH.data.dragons = fakeDef);
+  function mkDragon(id, type, x, y, stage) {
+    return { id: id, active: true, type: type, def: dragonDefs[type], x: x, y: y, stage: stage, xp: 0, form: null, instincts: [], targeting: 'first',
+      cooldown: 0, attackCount: 0, targetId: -1, aim: 0, attackT: 9, stats: { range: dragonDefs[type].base.range * (1 + .05 * stage) } };
+  }
+  var dragons = [mkDragon(101, 'ember', 400, 200, 0), mkDragon(102, 'frost', 620, 205, 1), mkDragon(103, 'venom', 480, 400, 2)];
+
+  var projectiles = [
+    { id: 201, active: true, kind: 'fireball', x: 200, y: 200, vx: 300, vy: 80 },
+    { id: 202, active: true, kind: 'shard', x: 260, y: 230, vx: 300, vy: -100 },
+    { id: 203, active: true, kind: 'spit', x: 320, y: 215, vx: 250, vy: 150 },
+    { id: 204, active: true, kind: 'lava', x: 700, y: 400, vx: 200, vy: -200 },
+    { id: 205, active: true, kind: 'lance', x: 800, y: 380, vx: 400, vy: 60 }
+  ];
+  var zones = [
+    { id: 301, active: true, kind: 'lava', x: 560, y: 300, r: 35, t: 2, maxT: 3 },
+    { id: 302, active: true, kind: 'cloud', x: 330, y: 300, r: 45, t: 3, maxT: 4 },
+    { id: 303, active: true, kind: 'steam', x: 700, y: 110, r: 50, t: .3, maxT: .6 }
+  ];
+
+  var game = { level: level, hoard: 14, hoardMax: 20, enemies: enemies, dragons: dragons, projectiles: projectiles, zones: zones,
+    events: HH.EventBus(), time: 0 };
+  var app = { game: game, speed: 1, paused: false, muted: false, screen: 'play', placing: 'ember', selectedId: 102, mouse: { x: 560, y: 200, inMap: true } };
+
+  var canvas = document.getElementById('game');
+  HH.render.init(canvas);
+  HH.render.bind(game);
+
+  canvas.addEventListener('mousemove', function (ev) {
+    var r = canvas.getBoundingClientRect(), s = r.width / 1280;
+    app.mouse.x = (ev.clientX - r.left) / s; app.mouse.y = (ev.clientY - r.top) / s - 48;
+    app.mouse.inMap = app.mouse.x >= 0 && app.mouse.x < 1040 && app.mouse.y >= 0 && app.mouse.y < 672;
+  });
+  window.addEventListener('keydown', function (e) { if (e.key === 'p' || e.key === 'P') app.paused = !app.paused; });
+
+  var step = 0;
+  function burst() {
+    var e = enemies[step % enemies.length], ev = game.events;
+    switch (step % 9) {
+      case 0: ev.emit('enemyKilled', { enemy: e, x: e.x, y: e.y, reward: 4 + step % 6, dragon: dragons[0] }); break;
+      case 1: ev.emit('enemyHit', { enemy: e, dmg: 1, dragon: dragons[0], kind: 'hit' }); break;
+      case 2: ev.emit('enemyLeaked', { enemy: e, steals: 1 }); break;
+      case 3: ev.emit('combo', { kind: 'blight', enemy: e, x: e.x, y: e.y }); break;
+      case 4: ev.emit('combo', { kind: 'steam', enemy: e, x: e.x, y: e.y }); break;
+      case 5: ev.emit('freeze', { enemy: e }); break;
+      case 6: ['fireball', 'shard', 'spit', 'lava', 'lance'].forEach(function (k, j) { ev.emit('projectileHit', { proj: { kind: k }, x: 150 + j * 60, y: 520 }); }); break;
+      case 7: ev.emit('dragonPlaced', { dragon: dragons[step % 3] }); ev.emit('dragonAttack', { dragon: dragons[0], target: e, cone: true }); break;
+      case 8: ev.emit('stageUp', { dragon: dragons[step % 3], stage: 1 }); break;
+    }
+    step++;
+  }
+  setInterval(function () { if (!app.paused) burst(); }, 700);
+  canvas.addEventListener('click', burst);
+
+  var last = performance.now();
+  var hitTimer = 0;
+  function frame(now) {
+    var dt = Math.min(0.1, (now - last) / 1000); last = now;
+    if (!app.paused) {
+      hitTimer += dt;
+      enemies.forEach(function (e, k) {
+        e.hitT += dt;
+        if (e.status.freeze) return;
+        e.dist += e.def.speed * C.SPEED_UNIT * dt * (e.status.chill ? .7 : 1);
+        var a = at(e.dist); e.x = a.x; e.y = a.y; e.angle = a.angle;
+      });
+      if (hitTimer > 1.5) { hitTimer = 0; enemies[6].hitT = 0; enemies[0].hitT = 0; }
+      dragons.forEach(function (d, k) { d.aim = now / 1000 * (.6 + .2 * k) + k; });
+      projectiles.forEach(function (p, k) {
+        p.x += p.vx * dt; p.y += p.vy * dt;
+        if (p.x > 900 || p.x < 100 || p.y < 150 || p.y > 520) { p.vx = -p.vx; p.vy = -p.vy; }
+      });
+      zones.forEach(function (z) { z.t -= dt; if (z.t < 0) z.t = z.maxT; });
+    }
+    HH.render.draw(app, dt);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  window.__hh = { app: app, game: game };
+})();
+</script>
+</body>
+</html>
